@@ -1,3 +1,5 @@
+**server.py (نسخه‌ی به‌روز فقط با تغییر پرامپت)**
+```python
 # server.py
 import os, io, base64
 import httpx
@@ -52,15 +54,56 @@ async def webhook(req: Request):
         await send_text(chat_id, "پیامت رسید ✅ یک عکس هم بفرست تا دقیق‌تر راهنمایی کنم.")
     return {"ok": True}
 
+# -------- Prompt Builder (فقط همین بخش جدید شده) --------
+from typing import Optional, Dict
+
+def build_prompt_fa(vendor: str = "", item: str = "", params: Optional[Dict[str, str]] = None) -> str:
+    """
+    پرامپت تخصصی و فشرده برای ارزیابی پخت پیتزا از روی تصویر.
+    - می‌تواند بعداً با vendor/item/params پر شود (از شیت یا کپشن)، ولی فعلاً اختیاری‌اند.
+    """
+    params = params or {}
+    # کلیدهای فارسی/انگلیسی هر دو پشتیبانی می‌شوند
+    oven_temp   = params.get("OvenTemp")   or params.get("دمای فر")        or ""
+    bake_time   = params.get("BakeTime")   or params.get("زمان پخت")       or ""
+    style       = params.get("Style")      or params.get("استایل")         or ""
+    hydration   = params.get("Hydration")  or params.get("هیدریشن")        or ""
+    cheese_type = params.get("Cheese")     or params.get("نوع پنیر")       or ""
+    sauce       = params.get("Sauce")      or params.get("سس")             or ""
+
+    meta = []
+    if vendor:      meta.append(f"- وندور: {vendor}")
+    if item:        meta.append(f"- آیتم: {item}")
+    if style:       meta.append(f"- استایل: {style}")
+    if oven_temp:   meta.append(f"- دمای مرجع: {oven_temp}")
+    if bake_time:   meta.append(f"- زمان مرجع: {bake_time}")
+    if hydration:   meta.append(f"- هیدریشن: {hydration}")
+    if cheese_type: meta.append(f"- پنیر: {cheese_type}")
+    if sauce:       meta.append(f"- سس: {sauce}")
+    meta_block = ("\n" + "\n".join(meta) + "\n") if meta else ""
+
+    return (
+        "تو یک سرآشپز و متخصص پخت پیتزا هستی و باید از روی تصویر، کیفیت پخت را دقیق ارزیابی کنی.\n"
+        "مشخصات مورد توجه:" + meta_block + "\n"
+        "راهنما (فقط برای تحلیل ذهنی تو — چیزی از این بخش چاپ نکن):\n"
+        "• لبه/کرست: پف، رنگ (قهوه‌ای طلایی/سوختگی)، لئوپاردینگ، خشکی/نمناک\n"
+        "• کف (Undercarriage): روشن/یکنواخت/سوختگی نقطه‌ای/خام\n"
+        "• مرکز: پخت کامل یا خمیری/آب‌افتادگی\n"
+        "• پنیر: ذوب، روغن‌اندازی، کشسانی، دانه‌دانه/لاستیکی\n"
+        "• تاپینگ: توزیع، رطوبت، فشار روی پخت خمیر\n"
+        "• همخوانی با استایل/برند (نئاپولیتن مرکز نرم قابل‌قبول؛ نیویورکی کف سفت‌تر)\n"
+        "• اگر پارامترهای مرجع بالا موجودند، توصیه‌ها را با آنها همسو کن.\n\n"
+        "اکنون فقط این خروجی کوتاه چاپ شود (بدون توضیح اضافه، بدون ایموجی، حداکثر ۲ خط):\n"
+        "1) وضعیت پخت: «خوب» یا «کم‌پخت» یا «بیش‌پخت/سوخته» + یک اشارهٔ ۲-۳ کلمه‌ای به علت.\n"
+        "2) ۲ تا ۳ توصیهٔ دقیق و اجراپذیر (دما/زمان/پیش‌گرمایش/جایگاه در فر/تاپینگ/ضخامت خمیر) بسیار کوتاه.\n"
+    )
+
 # -------- OpenAI Vision (gpt-4o-mini) --------
 async def oai_analyze(image_bytes: bytes) -> str:
     img_b64 = base64.b64encode(image_bytes).decode("utf-8")
-    prompt_fa = (
-        "تو یک متخصص پخت پیتزا هستی. این عکس را ببین و خیلی کوتاه و کاربردی به فارسی بگو:\n"
-        "1) وضعیت پخت (خوب/کم‌پخت/سوخته)\n"
-        "2) 2 تا 3 توصیهٔ دقیق (مثلاً دما/زمان/پیش‌گرمایش/چیدمان تاپینگ)\n"
-        "خروجی کوتاه باشد و مستقیم قابل اجرا."
-    )
+    # در آینده اگر از شیت/کپشن vendor/item داری، اینجا پاس بده:
+    # prompt_fa = build_prompt_fa(vendor, item, params)
+    prompt_fa = build_prompt_fa()  # فعلاً بدون vendor/item
     resp = OPENAI.chat.completions.create(
         model="gpt-4o-mini",
         messages=[{
@@ -88,3 +131,6 @@ async def download_telegram_file(file_id: str) -> bytes:
 async def send_text(chat_id: int, text: str):
     async with httpx.AsyncClient(timeout=20) as cx:
         await cx.post(f"{TG_API}/sendMessage", json={"chat_id": chat_id, "text": text})
+```
+
+
