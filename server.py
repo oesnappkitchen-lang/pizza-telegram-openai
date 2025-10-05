@@ -1,45 +1,40 @@
 # server.py
-import os, base64, json, csv, io
+import os, base64, csv, io, json
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from openai import OpenAI
 from typing import Optional, Dict, Tuple
 
-# ===== ENV =====
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
-OPENAI = OpenAI()  # uses OPENAI_API_KEY
-
-# Google Sheets — دو مسیر: CSV منتشرشده یا Service Account
-SHEET_CSV_URL     = os.getenv("SHEET_CSV_URL", "https://docs.google.com/spreadsheets/d/e/2PACX-1vSaY9JOJ_VfO6sf1Y-KNr2YU202184PFpydDTpwTMV9zwxiBnZHKij46yx4qkbadHTJfJagLg4Lq01P/pub?gid=1314383190&single=true&output=csv").strip()       # ← شما اینو گذاشتی
-SHEET_ID          = os.getenv("SHEET_ID", "1oGqOX01oweZ3nnfogK1VPmTBeqQcMjL0lhpvFVeM_ag").strip()            # اختیاری اگر خواستی از API بخونی
-SHEET_TAB         = os.getenv("SHEET_TAB", "pizza").strip()     # اختیاری
-GCP_SA_JSON_B64   = os.getenv("GCP_SA_JSON_BASE64", "").strip()  # اختیاری
+# ========= ENV =========
+TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", "").strip()
+OPENAI           = OpenAI()  # uses OPENAI_API_KEY
+SHEET_CSV_URL    = os.getenv("SHEET_CSV_URL", "https://docs.google.com/spreadsheets/d/e/2PACX-1vSaY9JOJ_VfO6sf1Y-KNr2YU202184PFpydDTpwTMV9zwxiBnZHKij46yx4qkbadHTJfJagLg4Lq01P/pub?gid=1314383190&single=true&output=csv").strip()  # لینک publish شده با output=csv
 
 TG_API  = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 TG_FILE = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}"
 
 app = FastAPI(title="Pizza AI Telegram (OpenAI)")
 
-# ===== Health =====
+# ========= Health =========
 @app.get("/health")
 async def health():
     return {"ok": True}
 
-# ===== Webhook =====
+# ========= Webhook =========
 @app.post("/webhook")
 async def webhook(req: Request):
     if not TELEGRAM_TOKEN:
         return JSONResponse({"ok": False, "error": "missing TELEGRAM_TOKEN"}, status_code=500)
 
     data = await req.json()
-    msg = data.get("message") or data.get("edited_message") or {}
+    msg  = data.get("message") or data.get("edited_message") or {}
     chat = (msg.get("chat") or {})
     chat_id = chat.get("id")
     if not chat_id:
         return {"ok": True}
 
-    text = (msg.get("text") or "").strip()
+    text   = (msg.get("text") or "").strip()
     photos = msg.get("photo") or []
 
     if text and text.startswith("/start"):
@@ -54,14 +49,18 @@ async def webhook(req: Request):
     if photos:
         file_id = photos[-1]["file_id"]
         caption = (msg.get("caption") or "").strip()
-        brand, branch = parse_brand_branch_caption(caption)  # فقط برند و شعبه
 
         try:
+            brand, branch = parse_brand_branch_caption(caption)
+            if not brand:
+                await send_text(chat_id, "⚠️ لطفاً برند را در کپشن بنویس: «برند: ... | شعبه: ...»")
+                return {"ok": True}
+
             # 1) دانلود عکس
             img_bytes = await download_telegram_file(file_id)
 
-            # 2) خواندن مرجع از شیت (اول CSV؛ اگر نبود، API)
-            ref = await sheet_lookup_brand_branch(brand, branch)
+            # 2) خواندن مرجع فقط با برند از CSV
+            ref = await sheet_lookup_by_brand(brand)
 
             # 3) پارام‌های مرجع برای پرامپت
             params: Dict[str, str] = {}
@@ -69,45 +68,46 @@ async def webhook(req: Request):
                 if ref.get("OvenTemp"): params["OvenTemp"] = ref["OvenTemp"]
                 if ref.get("BakeTime"): params["BakeTime"] = ref["BakeTime"]
 
-            # 4) تحلیل هوش مصنوعی (خروجی دقیقاً دو خط)
+            # 4) تحلیل دوخطی
             result = await oai_analyze(img_bytes, brand=brand, params=params)
 
-            # 5) ساخت خط مرجع (فقط دما و زمان؛ اگر در شیت موجود باشد)
+            # 5) خط مرجع
             ref_line = ""
             if ref:
                 bits = []
-                if ref.get("OvenTemp"): bits.append(f"دمای مرجع: {ref['OvenTemp']}")
-                if ref.get("BakeTime"): bits.append(f"زمان مرجع: {ref['BakeTime']}")
+                if branch:               bits.append(f"شعبه: {branch}")
+                if ref.get("OvenTemp"):  bits.append(f"دمای مرجع: {ref['OvenTemp']}")
+                if ref.get("BakeTime"):  bits.append(f"زمان مرجع: {ref['BakeTime']}")
                 if bits:
                     ref_line = "———\n" + " | ".join(bits)
 
-            # 6) ارسال پاسخ ترکیبی
-            await send_text(chat_id, (result + ("\n" + ref_line if ref_line else "")))
+            await send_text(chat_id, result + ("\n" + ref_line if ref_line else ""))
 
         except Exception as e:
-            print("ERROR:", e)
+            print("ERROR processing:", repr(e))
             await send_text(chat_id, "⚠️ خطا در پردازش. لطفاً دوباره تلاش کن.")
         return {"ok": True}
 
     if text:
-        await send_text(chat_id, "برای بهترین نتیجه: عکس + کپشن فارسی شامل «برند» و «شعبه» بفرست. مثال /start را ببین.")
+        await send_text(chat_id, "برای بهترین نتیجه: عکس + کپشن فارسی شامل «برند» و (اختیاری) «شعبه» بفرست.")
     return {"ok": True}
 
-# ===== Parse Persian caption: "برند: X | شعبه: Y" =====
+# ========= Caption parsing (FA): "برند: X | شعبه: Y" =========
 def parse_brand_branch_caption(text: str) -> Tuple[str, str]:
     brand = branch = ""
     if not text:
         return brand, branch
-    parts = [p.strip() for p in text.split("|")]
+    # نرمال‌سازی
+    t = text.replace("ي", "ی").replace("ك", "ک").strip().replace("：", ":")
+    parts = [p.strip() for p in t.split("|")]
     for p in parts:
-        t = p.replace("ي","ی").replace("ك","ک").strip()  # نرمال‌سازی
-        if t.startswith("برند:"):
-            brand = t.split(":", 1)[1].strip()
-        if t.startswith("شعبه:"):
-            branch = t.split(":", 1)[1].strip()
+        if p.startswith("برند:"):
+            brand = p.split(":", 1)[1].strip()
+        elif p.startswith("شعبه:"):
+            branch = p.split(":", 1)[1].strip()
     return brand, branch
 
-# ===== Prompt (خروجی دقیقاً دو خط) =====
+# ========= Prompt (exactly two lines) =========
 def build_prompt_fa(brand: str = "", params: Optional[Dict[str, str]] = None) -> str:
     params = params or {}
     meta = []
@@ -122,7 +122,7 @@ def build_prompt_fa(brand: str = "", params: Optional[Dict[str, str]] = None) ->
         "خط۲: سه توصیهٔ خیلی کوتاه و اجراپذیر (دما/زمان/پیش‌گرمایش/جایگاه فر/تاپینگ/ضخامت) با «؛» جدا شود."
     )
 
-# ===== OpenAI (تحلیل تصویر) =====
+# ========= OpenAI (vision) =========
 async def oai_analyze(image_bytes: bytes, brand: str = "", params: Optional[Dict[str, str]] = None) -> str:
     img_b64 = base64.b64encode(image_bytes).decode("utf-8")
     prompt_fa = build_prompt_fa(brand, params)
@@ -146,81 +146,58 @@ async def oai_analyze(image_bytes: bytes, brand: str = "", params: Optional[Dict
     )
     return (resp.choices[0].message.content or "نتیجه‌ای دریافت نشد.").strip()
 
-# ===== Sheets lookup (اول CSV؛ اگر نبود API) =====
-async def sheet_lookup_brand_branch(brand_fa: str, branch_fa: str) -> Optional[Dict[str, str]]:
+# ========= CSV lookup by Brand only =========
+async def sheet_lookup_by_brand(brand_fa: str) -> Optional[Dict[str, str]]:
     """
-    ستون‌های قابل قبول:
-      فارسی:  وندور/برند | شعبه | دما | زمان
-      انگلیسی: Vendor/Brand | Branch | OvenTemp/Temp | BakeTime/Time
+    فقط با برند از CSV منتشرشده می‌خواند.
+    هدرهای قابل‌قبول:
+      فارسی:  وندور/برند | دما | زمان
+      انگلیسی: Vendor/Brand | OvenTemp/Temp | BakeTime/Time
     """
+    csv_url = SHEET_CSV_URL
     brand_fa = (brand_fa or "").strip()
-    branch_fa = (branch_fa or "").strip()
-    if not brand_fa:
+    if not (csv_url and brand_fa):
+        print("CSV/brand missing:", bool(csv_url), brand_fa)
         return None
 
     def norm(s: str) -> str:
-        s = (s or "").strip()
-        s = s.replace("ي","ی").replace("ك","ک")
-        return s
+        return (s or "").strip().replace("ي","ی").replace("ك","ک")
 
     wanted = {
-        "brand":  ["وندور","برند","Vendor","Brand"],
-        "branch": ["شعبه","Branch"],
-        "temp":   ["دما","OvenTemp","Temp"],
-        "time":   ["زمان","BakeTime","Time"],
+        "brand": ["وندور","برند","Vendor","Brand"],
+        "temp":  ["دما","OvenTemp","Temp"],
+        "time":  ["زمان","BakeTime","Time"],
     }
 
-    rows = None
-
-    # مسیر 1: CSV منتشرشده
-    if SHEET_CSV_URL:
+    try:
         async with httpx.AsyncClient(timeout=20) as cx:
-            r = await cx.get(SHEET_CSV_URL)
+            r = await cx.get(csv_url)
             r.raise_for_status()
-            csv_bytes = r.content
-        rows = list(csv.DictReader(io.StringIO(csv_bytes.decode("utf-8"))))
-
-    # مسیر 2: Sheets API (اختیاری)
-    elif GCP_SA_JSON_B64 and SHEET_ID:
-        import gspread
-        from google.oauth2.service_account import Credentials
-        sa_info = json.loads(base64.b64decode(GCP_SA_JSON_B64).decode("utf-8"))
-        creds = Credentials.from_service_account_info(sa_info, scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"])
-        gc = gspread.authorize(creds)
-        ws = gc.open_by_key(SHEET_ID).worksheet(SHEET_TAB)
-        rows = ws.get_all_records()
-
-    if not rows:
+            rows = list(csv.DictReader(io.StringIO(r.content.decode("utf-8"))))
+    except Exception as e:
+        print("CSV fetch error:", e)
         return None
 
-    def get_val(r: dict, keys):
+    def get_val(row: dict, keys: list[str]) -> str:
         for k in keys:
-            for kk in r.keys():
+            for kk in row.keys():
                 if norm(kk) == norm(k):
-                    v = str(r[kk]).strip()
+                    v = str(row[kk]).strip()
                     if v:
                         return v
         return ""
 
     b_low = norm(brand_fa).lower()
-    br_low = norm(branch_fa).lower()
-
-    # تلاش 1: برند+شعبه
-    for r in rows:
-        rv = norm(get_val(r, wanted["brand"])).lower()
-        rb = norm(get_val(r, wanted["branch"])).lower()
-        if rv == b_low and br_low and rb == br_low:
-            return {"OvenTemp": get_val(r, wanted["temp"]), "BakeTime": get_val(r, wanted["time"])}
-
-    # تلاش 2: فقط برند
-    for r in rows:
-        rv = norm(get_val(r, wanted["brand"])).lower()
+    for row in rows:
+        rv = norm(get_val(row, wanted["brand"])).lower()
         if rv == b_low:
-            return {"OvenTemp": get_val(r, wanted["temp"]), "BakeTime": get_val(r, wanted["time"])}
-
+            return {
+                "OvenTemp": get_val(row, wanted["temp"]),
+                "BakeTime": get_val(row, wanted["time"]),
+            }
     return None
 
-# ===== Telegram helpers =====
+# ========= Telegram helpers =========
 async def download_telegram_file(file_id: str) -> bytes:
     async with httpx.AsyncClient(timeout=30) as cx:
         r = await cx.get(f"{TG_API}/getFile", params={"file_id": file_id})
