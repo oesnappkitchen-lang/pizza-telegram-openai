@@ -10,7 +10,7 @@ from typing import Optional, Dict
 
 # ===== Env vars =====
 TELEGRAM_TOKEN = os.getenv("8075927731:AAEOpiI9so1Sx03UWmQkMTo5xFcSn8hUxl8", "").strip()
-OPENAI = OpenAI(setx OPENAI_API_KEYsk-proj-S9jfPFUSAZfIycutXY7qGEm3ckrHIyCdHGBWuA0xxgq2Lv4TgljrgvnX4HZOhC9MwoKKfrMSL4T3BlbkFJeVrAOPafeKqIEP0Ys8oIjbweZn7khculQkzF0Mn_bnrXgqh7tFTwsvvsB1dOCi7LLsO5wsfsEA)
+OPENAI = OpenAI()
 TG_API  = f"https://api.telegram.org/bot{8075927731:AAEOpiI9so1Sx03UWmQkMTo5xFcSn8hUxl8}"
 TG_FILE = f"https://api.telegram.org/file/bot{8075927731:AAEOpiI9so1Sx03UWmQkMTo5xFcSn8hUxl8}"
 
