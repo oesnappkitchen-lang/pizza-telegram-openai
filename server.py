@@ -9,10 +9,13 @@ from openai import OpenAI
 from typing import Optional, Dict
 
 # ===== Env vars =====
-TELEGRAM_TOKEN = os.getenv("8075927731:AAEOpiI9so1Sx03UWmQkMTo5xFcSn8hUxl8", "").strip()
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
+
+TG_API  = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+TG_FILE = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}"
+
 OPENAI = OpenAI()
-TG_API  = f"https://api.telegram.org/bot{8075927731:AAEOpiI9so1Sx03UWmQkMTo5xFcSn8hUxl8}"
-TG_FILE = f"https://api.telegram.org/file/bot{8075927731:AAEOpiI9so1Sx03UWmQkMTo5xFcSn8hUxl8}"
+
 
 app = FastAPI(title="Pizza AI Telegram (OpenAI)")
 
