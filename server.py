@@ -1,4 +1,20 @@
+
 # server.py
+@app.get("/set_webhook")
+async def set_webhook():
+    if not TELEGRAM_TOKEN:
+        return {"ok": False, "error": "missing TELEGRAM_TOKEN"}
+    url = "https://pizza-telegram-openai.onrender.com/webhook"  # دقیقا دامنه سرویس خودت
+    async with httpx.AsyncClient(timeout=20) as cx:
+        r = await cx.get(f"{TG_API}/setWebhook", params={"url": url})
+        return r.json()
+
+@app.get("/get_webhook_info")
+async def get_webhook_info():
+    async with httpx.AsyncClient(timeout=20) as cx:
+        r = await cx.get(f"{TG_API}/getWebhookInfo")
+        return r.json()
+
 import os, base64, csv, io, json
 import httpx
 from fastapi import FastAPI, Request
