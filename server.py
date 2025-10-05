@@ -1,5 +1,5 @@
 # server.py
-import os, base64, json
+import os, base64, json, csv, io
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -10,10 +10,11 @@ from typing import Optional, Dict, Tuple
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 OPENAI = OpenAI()  # uses OPENAI_API_KEY
 
-# Google Sheets (read-only)
-SHEET_ID   = os.getenv("SHEET_ID", "1oGqOX01oweZ3nnfogK1VPmTBeqQcMjL0lhpvFVeM_ag").strip()          # فقط ID شیت (نه لینک کامل)
-SHEET_TAB  = os.getenv("SHEET_TAB", "pizza").strip()   # اسم تب
-GCP_SA_JSON_B64 = os.getenv("GCP_SA_JSON_BASE64", "").strip()  # JSON سرویس‌اکانت Base64
+# Google Sheets — دو مسیر: CSV منتشرشده یا Service Account
+SHEET_CSV_URL     = os.getenv("SHEET_CSV_URL", "https://docs.google.com/spreadsheets/d/e/2PACX-1vSaY9JOJ_VfO6sf1Y-KNr2YU202184PFpydDTpwTMV9zwxiBnZHKij46yx4qkbadHTJfJagLg4Lq01P/pub?gid=1314383190&single=true&output=csv").strip()       # ← شما اینو گذاشتی
+SHEET_ID          = os.getenv("SHEET_ID", "1oGqOX01oweZ3nnfogK1VPmTBeqQcMjL0lhpvFVeM_ag").strip()            # اختیاری اگر خواستی از API بخونی
+SHEET_TAB         = os.getenv("SHEET_TAB", "pizza").strip()     # اختیاری
+GCP_SA_JSON_B64   = os.getenv("GCP_SA_JSON_BASE64", "").strip()  # اختیاری
 
 TG_API  = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 TG_FILE = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}"
@@ -53,13 +54,13 @@ async def webhook(req: Request):
     if photos:
         file_id = photos[-1]["file_id"]
         caption = (msg.get("caption") or "").strip()
-        brand, branch = parse_brand_branch_caption(caption)  # ← فقط برند و شعبه
+        brand, branch = parse_brand_branch_caption(caption)  # فقط برند و شعبه
 
         try:
             # 1) دانلود عکس
             img_bytes = await download_telegram_file(file_id)
 
-            # 2) خواندن مرجع از شیت (اولویت: برند+شعبه؛ اگر ستون شعبه در شیت نبود/پیدا نشد → فقط برند)
+            # 2) خواندن مرجع از شیت (اول CSV؛ اگر نبود، API)
             ref = await sheet_lookup_brand_branch(brand, branch)
 
             # 3) پارام‌های مرجع برای پرامپت
@@ -145,59 +146,78 @@ async def oai_analyze(image_bytes: bytes, brand: str = "", params: Optional[Dict
     )
     return (resp.choices[0].message.content or "نتیجه‌ای دریافت نشد.").strip()
 
-# ===== Google Sheets lookup (Brand [+ Branch if available]) =====
+# ===== Sheets lookup (اول CSV؛ اگر نبود API) =====
 async def sheet_lookup_brand_branch(brand_fa: str, branch_fa: str) -> Optional[Dict[str, str]]:
     """
-    از شیت می‌خواند:
-      - اگر ستون «شعبه/Branch» وجود داشت: دقیقاً برند+شعبه را پیدا می‌کند.
-      - اگر نبود یا پیدا نشد: اولین ردیف مطابق با برند.
-    ستون‌های پذیرفته‌شده:
+    ستون‌های قابل قبول:
       فارسی:  وندور/برند | شعبه | دما | زمان
       انگلیسی: Vendor/Brand | Branch | OvenTemp/Temp | BakeTime/Time
     """
-    if not (SHEET_ID and GCP_SA_JSON_B64 and brand_fa):
+    brand_fa = (brand_fa or "").strip()
+    branch_fa = (branch_fa or "").strip()
+    if not brand_fa:
         return None
 
-    import gspread
-    from google.oauth2.service_account import Credentials
+    def norm(s: str) -> str:
+        s = (s or "").strip()
+        s = s.replace("ي","ی").replace("ك","ک")
+        return s
 
-    sa_info = json.loads(base64.b64decode(GCP_SA_JSON_B64).decode("utf-8"))
-    scopes = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
-    creds = Credentials.from_service_account_info(sa_info, scopes=scopes)
-    gc = gspread.authorize(creds)
-    ws = gc.open_by_key(SHEET_ID).worksheet(SHEET_TAB)
+    wanted = {
+        "brand":  ["وندور","برند","Vendor","Brand"],
+        "branch": ["شعبه","Branch"],
+        "temp":   ["دما","OvenTemp","Temp"],
+        "time":   ["زمان","BakeTime","Time"],
+    }
 
-    rows = ws.get_all_records()  # list[dict]
+    rows = None
 
-    def get_val(r: dict, *keys):
+    # مسیر 1: CSV منتشرشده
+    if SHEET_CSV_URL:
+        async with httpx.AsyncClient(timeout=20) as cx:
+            r = await cx.get(SHEET_CSV_URL)
+            r.raise_for_status()
+            csv_bytes = r.content
+        rows = list(csv.DictReader(io.StringIO(csv_bytes.decode("utf-8"))))
+
+    # مسیر 2: Sheets API (اختیاری)
+    elif GCP_SA_JSON_B64 and SHEET_ID:
+        import gspread
+        from google.oauth2.service_account import Credentials
+        sa_info = json.loads(base64.b64decode(GCP_SA_JSON_B64).decode("utf-8"))
+        creds = Credentials.from_service_account_info(sa_info, scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"])
+        gc = gspread.authorize(creds)
+        ws = gc.open_by_key(SHEET_ID).worksheet(SHEET_TAB)
+        rows = ws.get_all_records()
+
+    if not rows:
+        return None
+
+    def get_val(r: dict, keys):
         for k in keys:
-            if k in r and str(r[k]).strip():
-                return str(r[k]).strip()
+            for kk in r.keys():
+                if norm(kk) == norm(k):
+                    v = str(r[kk]).strip()
+                    if v:
+                        return v
         return ""
 
-    b_low = brand_fa.strip().lower()
-    br_low = (branch_fa or "").strip().lower()
+    b_low = norm(brand_fa).lower()
+    br_low = norm(branch_fa).lower()
 
-    # تلاش 1: برند + شعبه (اگر ستون شعبه وجود داشته باشد)
-    found_branch_column = any("شعبه" in r or "Branch" in r for r in rows[:1] or [{}])
-    if found_branch_column and br_low:
-        for r in rows:
-            rv = (get_val(r, "وندور", "برند", "Vendor", "Brand")).lower()
-            rb = (get_val(r, "شعبه", "Branch")).lower()
-            if rv == b_low and rb == br_low:
-                return {
-                    "OvenTemp": get_val(r, "دما", "OvenTemp", "Temp"),
-                    "BakeTime": get_val(r, "زمان", "BakeTime", "Time"),
-                }
+    # تلاش 1: برند+شعبه
+    for r in rows:
+        rv = norm(get_val(r, wanted["brand"])).lower()
+        rb = norm(get_val(r, wanted["branch"])).lower()
+        if rv == b_low and br_low and rb == br_low:
+            return {"OvenTemp": get_val(r, wanted["temp"]), "BakeTime": get_val(r, wanted["time"])}
 
     # تلاش 2: فقط برند
     for r in rows:
-        rv = (get_val(r, "وندور", "برند", "Vendor", "Brand")).lower()
+        rv = norm(get_val(r, wanted["brand"])).lower()
         if rv == b_low:
-            return {
-                "OvenTemp": get_val(r, "دما", "OvenTemp", "Temp"),
-                "BakeTime": get_val(r, "زمان", "BakeTime", "Time"),
-            }
+            return {"OvenTemp": get_val(r, wanted["temp"]), "BakeTime": get_val(r, wanted["time"])}
+
     return None
 
 # ===== Telegram helpers =====
