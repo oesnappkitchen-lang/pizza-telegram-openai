@@ -1,10 +1,32 @@
-
 # server.py
+import os, base64, csv, io
+import httpx
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+from openai import OpenAI
+from typing import Optional, Dict, Tuple
+
+# ========= ENV =========
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
+OPENAI = OpenAI()  # uses OPENAI_API_KEY from env
+SHEET_CSV_URL = os.getenv("SHEET_CSV_URL", "").strip()  # Google Sheets "Publish to web" CSV link
+
+TG_API  = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+TG_FILE = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}"
+
+app = FastAPI(title="Pizza AI Telegram (OpenAI + Sheet CSV)")
+
+# ========= Health =========
+@app.get("/health")
+async def health():
+    return {"ok": True}
+
+# ========= Webhook helpers (اختیاری برای راحتی ست‌کردن) =========
 @app.get("/set_webhook")
 async def set_webhook():
     if not TELEGRAM_TOKEN:
         return {"ok": False, "error": "missing TELEGRAM_TOKEN"}
-    url = "https://pizza-telegram-openai.onrender.com/webhook"  # دقیقا دامنه سرویس خودت
+    url = "https://pizza-telegram-openai.onrender.com/webhook"  # ← دامنه سرویس خودت
     async with httpx.AsyncClient(timeout=20) as cx:
         r = await cx.get(f"{TG_API}/setWebhook", params={"url": url})
         return r.json()
@@ -14,28 +36,6 @@ async def get_webhook_info():
     async with httpx.AsyncClient(timeout=20) as cx:
         r = await cx.get(f"{TG_API}/getWebhookInfo")
         return r.json()
-
-import os, base64, csv, io, json
-import httpx
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
-from openai import OpenAI
-from typing import Optional, Dict, Tuple
-
-# ========= ENV =========
-TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", "").strip()
-OPENAI           = OpenAI()  # uses OPENAI_API_KEY
-SHEET_CSV_URL    = os.getenv("SHEET_CSV_URL", "https://docs.google.com/spreadsheets/d/e/2PACX-1vSaY9JOJ_VfO6sf1Y-KNr2YU202184PFpydDTpwTMV9zwxiBnZHKij46yx4qkbadHTJfJagLg4Lq01P/pub?gid=1314383190&single=true&output=csv").strip()  # لینک publish شده با output=csv
-
-TG_API  = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
-TG_FILE = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}"
-
-app = FastAPI(title="Pizza AI Telegram (OpenAI)")
-
-# ========= Health =========
-@app.get("/health")
-async def health():
-    return {"ok": True}
 
 # ========= Webhook =========
 @app.post("/webhook")
@@ -62,6 +62,7 @@ async def webhook(req: Request):
         )
         return {"ok": True}
 
+    # حالت عکس
     if photos:
         file_id = photos[-1]["file_id"]
         caption = (msg.get("caption") or "").strip()
@@ -87,7 +88,7 @@ async def webhook(req: Request):
             # 4) تحلیل دوخطی
             result = await oai_analyze(img_bytes, brand=brand, params=params)
 
-            # 5) خط مرجع
+            # 5) خط مرجع (نمایش شعبه فقط تزئینی)
             ref_line = ""
             if ref:
                 bits = []
@@ -104,6 +105,7 @@ async def webhook(req: Request):
             await send_text(chat_id, "⚠️ خطا در پردازش. لطفاً دوباره تلاش کن.")
         return {"ok": True}
 
+    # حالت متن
     if text:
         await send_text(chat_id, "برای بهترین نتیجه: عکس + کپشن فارسی شامل «برند» و (اختیاری) «شعبه» بفرست.")
     return {"ok": True}
@@ -113,8 +115,8 @@ def parse_brand_branch_caption(text: str) -> Tuple[str, str]:
     brand = branch = ""
     if not text:
         return brand, branch
-    # نرمال‌سازی
-    t = text.replace("ي", "ی").replace("ك", "ک").strip().replace("：", ":")
+    # نرمال‌سازی و جداکردن
+    t = text.replace("ي", "ی").replace("ك", "ک").replace("：", ":").strip()
     parts = [p.strip() for p in t.split("|")]
     for p in parts:
         if p.startswith("برند:"):
@@ -123,7 +125,7 @@ def parse_brand_branch_caption(text: str) -> Tuple[str, str]:
             branch = p.split(":", 1)[1].strip()
     return brand, branch
 
-# ========= Prompt (exactly two lines) =========
+# ========= Prompt (EXACTLY two lines) =========
 def build_prompt_fa(brand: str = "", params: Optional[Dict[str, str]] = None) -> str:
     params = params or {}
     meta = []
@@ -194,7 +196,7 @@ async def sheet_lookup_by_brand(brand_fa: str) -> Optional[Dict[str, str]]:
         print("CSV fetch error:", e)
         return None
 
-    def get_val(row: dict, keys: list[str]) -> str:
+    def get_val(row: dict, keys) -> str:
         for k in keys:
             for kk in row.keys():
                 if norm(kk) == norm(k):
