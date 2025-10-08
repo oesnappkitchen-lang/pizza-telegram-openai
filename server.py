@@ -13,9 +13,9 @@ OPENAI = OpenAI()  # uses OPENAI_API_KEY
 TG_API  = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 TG_FILE = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}"
 
-app = FastAPI(title="Pizza Bake QA — Photo → Pick Brand → Result")
+app = FastAPI(title="Pizza QA — Brand → Item → Branch")
 
-# ===== DATA: چند ردیف برای هر برند =====
+# ===== مرجع دما/زمان هر برند (همان دیتای قبلی) =====
 DEFAULT_DATA_TEXT = """
 پلنت 8:20 دقیقه 240 درجه
 پلنت  9:20 240 درجه
@@ -25,26 +25,34 @@ DEFAULT_DATA_TEXT = """
 ایتزا 8:20 و 240 درجه
 """
 
-# ===== In-memory storage (ساده برای MVP) =====
+# ===== آیتم‌های هر برند (Vendor) —ــــ اینجا لیست خودت را بگذار =====
+VENDOR_ITEMS: Dict[str, List[str]] = {
+    # TODO: نمونه‌ها؛ بر اساس برند خودت تکمیل/تغییر بده
+    "پلنت":    ["پیتزا قارچ گوشت", "پیتزا پپرونی", "پیتزا سوسیس قارچ", "سوپریم","دونر مخصوص","پیتزا قارچ و مرغ","پیتزا بیکن","استرامبولی کباب ترکی"
+    ,"استرامبولی مرغ و قارچ","استرامبولی مرغ و بادمجون","نان سیر","پیتزا مخصوص","پیتزا ژامبون استیک","پیتزا هالوپینو ژامبون استیک","پیتزا سالامی فلفل"
+,"استرامبولی چیزی بلونیا","استرامبولی قارچ و گوشت هالوپینو","پیتزا چیکن پستو","استرامبولی چیکن پستو","سیب زمینی تنوری"],
+
+    "هپی پیتزا": [" پنینی پپرونی", "پنینی رست بیف ", "پنینی سبزیجات", "پنینی مرغ و پستو","پیتزا اسپشیال","پیتزا پپرونی","پیتزا پرومکس","پیتزا پرومکس"
+    ,"پیتزا رست بیف","پیتزا سبزیجات","پیتزا سیر و استیک","پیتزا قارچ و اسفناج","پیتزا هپی چیکن","پیتزا هپی میت","سیب زمینی تنوری","نان سیر","پیتزا هالو چیکن"],
+   
+    "ایتزا":    ["پیتزا بیکن", "پیتزا اسپشیال", "پیتزا استیک", "پیتزا مرغ ایتالیایی","پیتزا پپرونی ","پیتزا رستبیف"],
+}
+
+# ===== لیست شعبات —ــــ اینجا شعب خودت را بگذار =====
+BRANCH_CHOICES: List[str] = [
+    # TODO: نمونه‌ها؛ بر اساس شعب خودت تکمیل/تغییر بده
+    "سعادت‌آباد", "سهروردی", "میرداماد", "پونک", "تجریش","فلسطین","نواب","گیشا","ساعی","صادقیه","مجیدیه","وکیل آباد"
+]
+
+# ===== In-memory session (ساده) =====
 ACTIVE_DATA_TEXT: str = DEFAULT_DATA_TEXT
 DATA_PARSED: bool = False
-BRAND_MAP: Dict[str, List[Dict[str, str]]] = {}   # "پلنت" -> [{"time":"8:20 دقیقه","temp":"240 درجه"}, ...]
-SESSION_LAST_IMAGE: Dict[int, bytes] = {}          # chat_id -> image bytes
+BRAND_MAP: Dict[str, List[Dict[str, str]]] = {}    # "پلنت" -> [{"time":"8:20 دقیقه","temp":"240 درجه"}, ...]
+SESSION: Dict[int, Dict[str, object]] = {}          # chat_id -> {"image": bytes, "brand": str, "item": str, "branch": str}
 
 # ---------- Utils ----------
 def norm(s: str) -> str:
     return (s or "").strip().replace("ي","ی").replace("ك","ک")
-
-def parse_brand_branch_caption(text: str) -> Tuple[str, str]:
-    brand = branch = ""
-    if not text: return brand, branch
-    t = norm(text).replace("：", ":")
-    for part in [p.strip() for p in t.split("|")]:
-        if part.startswith("برند:"):
-            brand = part.split(":", 1)[1].strip()
-        elif part.startswith("شعبه:"):
-            branch = part.split(":", 1)[1].strip()
-    return brand, branch
 
 def _extract_time_and_temp(fragment: str) -> Tuple[Optional[str], Optional[str]]:
     frag = norm(fragment)
@@ -63,7 +71,7 @@ def parse_lines_to_brand_map(text: str) -> Dict[str, List[Dict[str, str]]]:
     mapping: Dict[str, List[Dict[str, str]]] = {}
     for raw in (text or "").splitlines():
         line = norm(raw)
-        if not line or line.startswith("#"):  # comment/empty
+        if not line or line.startswith("#"):
             continue
         m_num = re.search(r"\d", line)
         if not m_num:
@@ -78,7 +86,6 @@ def parse_lines_to_brand_map(text: str) -> Dict[str, List[Dict[str, str]]]:
             continue
         bkey = norm(brand)
         mapping.setdefault(bkey, []).append({"time": time_txt or "", "temp": temp_txt or ""})
-    # پاکسازی ردیف‌های خالی
     for k in list(mapping.keys()):
         mapping[k] = [x for x in mapping[k] if (x.get("time") or x.get("temp"))]
         if not mapping[k]:
@@ -93,7 +100,10 @@ def ensure_data():
 
 def all_brands() -> List[str]:
     ensure_data()
-    return list(BRAND_MAP.keys())
+    # فقط برندهایی که مرجع دارند یا در VENDOR_ITEMS تعریف شده‌اند
+    keys = set(BRAND_MAP.keys()) | set(norm(k) for k in VENDOR_ITEMS.keys())
+    # برگرداندن نام اصلی (بدون norm) اگر لازم داشتی می‌تونی مرتب‌سازی کنی
+    return list({k for k in VENDOR_ITEMS.keys()} | {k for k in BRAND_MAP.keys()})
 
 def lookup_brand_all(brand_fa: str) -> List[Dict[str, str]]:
     ensure_data()
@@ -105,26 +115,18 @@ def lookup_brand_all(brand_fa: str) -> List[Dict[str, str]]:
             return lst
     return []
 
+def get_session(chat_id: int) -> Dict[str, object]:
+    if chat_id not in SESSION:
+        SESSION[chat_id] = {"image": None, "brand": "", "item": "", "branch": ""}
+    return SESSION[chat_id]
+
+def _chunk(lst: List[str], n: int) -> List[List[str]]:
+    return [lst[i:i+n] for i in range(0, len(lst), n)]
+
 # ---------- Telegram helpers ----------
 async def send_text(chat_id: int, text: str):
     async with httpx.AsyncClient(timeout=20) as cx:
         await cx.post(f"{TG_API}/sendMessage", json={"chat_id": chat_id, "text": text})
-
-async def send_brand_keyboard(chat_id: int, prompt_text: str = "برند را انتخاب کن:"):
-    brands = all_brands()
-    if not brands:
-        await send_text(chat_id, "هیچ برندی در دیتا ثبت نیست. از /setdata استفاده کن.")
-        return
-    # حداکثر 8 تا برای سادگی (می‌تونی بیشتر هم بگذاری)
-    brands = brands[:8]
-    keyboard = [[{"text": b, "callback_data": f"pick_brand::{b}"}] for b in brands]
-    payload = {
-        "chat_id": chat_id,
-        "text": prompt_text,
-        "reply_markup": {"inline_keyboard": keyboard}
-    }
-    async with httpx.AsyncClient(timeout=20) as cx:
-        await cx.post(f"{TG_API}/sendMessage", json=payload)
 
 async def answer_callback(cb_id: str, text: str = ""):
     async with httpx.AsyncClient(timeout=20) as cx:
@@ -139,39 +141,65 @@ async def download_telegram_file(file_id: str) -> bytes:
         fr.raise_for_status()
         return fr.content
 
-# ---------- OpenAI analysis (دو خط حرفه‌ای) ----------
-async def analyze_bake_only(image_bytes: bytes) -> str:
-    """
-    EXACTLY two lines:
-      1) «وضعیت پخت: خوب/خام/سوخته/نیاز به بهبود»
-      2) «توضیح سرآشپز: …» (توصیف بصری دقیق؛ بدون دما/زمان/اعداد/ایموجی)
-    """
-    img_b64 = base64.b64encode(image_bytes).decode("utf-8")
+# ---------- Keyboards ----------
+async def send_brand_keyboard(chat_id: int):
+    brands = all_brands()
+    if not brands:
+        await send_text(chat_id, "هیچ برندی در دیتا ثبت نیست. از /setdata استفاده کن.")
+        return
+    rows = []
+    for row in _chunk(brands[:12], 3):
+        rows.append([{"text": b, "callback_data": f"brand::{b}"} for b in row])
+    payload = {
+        "chat_id": chat_id,
+        "text": "برند را انتخاب کن:",
+        "reply_markup": {"inline_keyboard": rows}
+    }
+    async with httpx.AsyncClient(timeout=20) as cx:
+        await cx.post(f"{TG_API}/sendMessage", json=payload)
 
+async def send_item_keyboard(chat_id: int, brand: str):
+    items = VENDOR_ITEMS.get(brand, [])
+    if not items:
+        # اگر برای برند آیتم تعریف نشده بود، حداقل یک گزینه عبوری بده
+        items = ["—"]
+    rows = []
+    for row in _chunk(items[:18], 3):
+        rows.append([{"text": it, "callback_data": f"item::{it}"} for it in row])
+    rows.append([{"text": "⏭️ بدون انتخاب", "callback_data": "item::<skip>"}])
+    payload = {"chat_id": chat_id, "text": f"آیتم «{brand}» را انتخاب کن:", "reply_markup": {"inline_keyboard": rows}}
+    async with httpx.AsyncClient(timeout=20) as cx:
+        await cx.post(f"{TG_API}/sendMessage", json=payload)
+
+async def send_branch_keyboard(chat_id: int):
+    rows = []
+    for row in _chunk(BRANCH_CHOICES, 3):
+        rows.append([{"text": b, "callback_data": f"branch::{b}"} for b in row])
+    rows.append([{"text": "⏭️ بدون انتخاب", "callback_data": "branch::<skip>"}])
+    payload = {"chat_id": chat_id, "text": "شعبه را انتخاب کن:", "reply_markup": {"inline_keyboard": rows}}
+    async with httpx.AsyncClient(timeout=20) as cx:
+        await cx.post(f"{TG_API}/sendMessage", json=payload)
+
+# ---------- OpenAI (دوخطیِ کیفیت پخت) ----------
+async def analyze_bake_only(image_bytes: bytes) -> str:
+    img_b64 = base64.b64encode(image_bytes).decode("utf-8")
     system_prompt = (
         "You are a Michelin-level pizza chef and quality auditor who ONLY evaluates bake quality from an image. "
-        "Language: Persian (fa-IR). "
-        "Return EXACTLY TWO LINES. No bullets, emojis, or extra whitespace. "
-        "NEVER suggest temperatures, times, or numeric settings. No recipes. "
-        "Line1 must start with: «وضعیت پخت: » followed by one of {خوب, خام, سوخته, نیاز به بهبود}. "
-        "Line2 must start with: «תوضیح سرآشپز: » and concisely describe visual reasons (cheese melt, crust color/char, center sogginess, evenness)."
+        "Language: Persian (fa-IR). Return EXACTLY TWO LINES. No emojis or numbers or temperature/time suggestions. "
+        "Line1: «وضعیت پخت: » + {خوب, خام, سوخته, نیاز به بهبود}. "
+        "Line2: «توضیح سرآشپز: » + concise visual reasons (cheese melt, crust color/char, center sogginess, evenness)."
     )
     user_prompt = (
-        "از روی تصویر فقط کیفیت پخت را ارزیابی کن. "
-        "به آب‌شدن پنیر، یکنواختی برشتگی و رنگ لبه‌ها، خام/سوخته بودن خمیر، خیس بودن مرکز و لکه‌های تیره توجه کن. "
-        "هیچ اشاره‌ای به دما/زمان یا اعداد نکن. "
-        "خروجی دقیقاً دو خط باشد:\n"
-        "وضعیت پخت: ...\n"
-        "توضیح سرآشپز: ..."
+        "از روی تصویر فقط کیفیت پخت را ارزیابی کن. به آب‌شدن پنیر، یکنواختی برشتگی و رنگ لبه‌ها، خام/سوخته بودن خمیر، "
+        "خیس بودن مرکز و لکه‌های تیره توجه کن. هیچ اشاره‌ای به دما/زمان نکن. خروجی دقیقاً دو خط باشد."
     )
-
     resp = OPENAI.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
             {"role":"system","content":system_prompt},
             {"role":"user","content":[
                 {"type":"text","text":user_prompt},
-                {"type":"image_url","image_url":{"url":f"data:image/jpeg;base64,{img_b64}"}}
+                {"type":"image_url","image_url":{"url": f"data:image/jpeg;base64,{img_b64}"}}
             ]}
         ],
         temperature=0.12,
@@ -192,7 +220,7 @@ async def health():
 async def set_webhook():
     if not TELEGRAM_TOKEN:
         return {"ok": False, "error": "missing TELEGRAM_TOKEN"}
-    url = "https://pizza-telegram-openai.onrender.com/webhook"  # دامنهٔ سرویس خودت
+    url = "https://pizza-telegram-openai.onrender.com/webhook"  # دامنه سرویس خودت
     async with httpx.AsyncClient(timeout=20) as cx:
         r = await cx.get(f"{TG_API}/setWebhook", params={"url": url})
         return r.json()
@@ -210,7 +238,7 @@ async def webhook(req: Request):
 
     payload = await req.json()
 
-    # ---- 1) Callback query (کاربر روی دکمه‌ی برند کلیک کرده) ----
+    # ---- Callback Buttons ----
     if "callback_query" in payload:
         cb = payload["callback_query"]
         cb_id = cb.get("id")
@@ -218,31 +246,63 @@ async def webhook(req: Request):
         msg  = cb.get("message") or {}
         chat = (msg.get("chat") or {})
         chat_id = chat.get("id")
+        ses = get_session(chat_id)
 
-        if data.startswith("pick_brand::"):
+        # برند انتخاب شد → برو به انتخاب آیتم (بر اساس همان برند)
+        if data.startswith("brand::"):
             brand = data.split("::", 1)[1]
-            img_bytes = SESSION_LAST_IMAGE.get(chat_id)
+            ses["brand"] = brand
+            ses["item"] = ""
+            ses["branch"] = ""
+            await answer_callback(cb_id, f"برند: {brand}")
+            await send_item_keyboard(chat_id, brand)
+            return {"ok": True}
+
+        # آیتم انتخاب شد → برو به انتخاب شعبه
+        if data.startswith("item::"):
+            val = data.split("::", 1)[1]
+            ses["item"] = "" if val == "<skip>" else val
+            await answer_callback(cb_id, "آیتم ثبت شد.")
+            await send_branch_keyboard(chat_id)
+            return {"ok": True}
+
+        # شعبه انتخاب شد → تحلیل + مرجع
+        if data.startswith("branch::"):
+            val = data.split("::", 1)[1]
+            ses["branch"] = "" if val == "<skip>" else val
+
+            img_bytes = ses.get("image")
             if not img_bytes:
                 await answer_callback(cb_id, "ابتدا یک عکس ارسال کن.")
-                await send_text(chat_id, "ابتدا یک عکس بفرست تا تحلیل انجام شود.")
+                await send_text(chat_id, "ابتدا یک عکس بفرست.")
                 return {"ok": True}
 
-            # تحلیل و ساخت خروجی
             analysis = await analyze_bake_only(img_bytes)
+            brand  = ses.get("brand") or ""
+            item   = ses.get("item") or ""
+            branch = ses.get("branch") or ""
+
             rows = lookup_brand_all(brand)
             ref_block = ""
-            if rows:
-                header = f"مرجع «{brand}»"
+            if brand and rows:
+                bits = [f"مرجع «{brand}»"]
+                if item:   bits.append(f"آیتم: {item}")
+                if branch: bits.append(f"شعبه: {branch}")
+                header = " | ".join(bits)
                 lines  = [f"• {(r.get('temp') or '—')}" + (f" | {r.get('time')}" if r.get('time') else "") for r in rows]
                 ref_block = f"\n———\n{header}:\n" + "\n".join(lines)
 
-            await answer_callback(cb_id, f"برند انتخاب شد: {brand}")
+            await answer_callback(cb_id, "ثبت شد ✅")
             await send_text(chat_id, analysis + ref_block)
-            # (می‌تونی اگر خواستی بعد ارسال پاک کنی تا عکس بعدی لازم باشه)
-            # SESSION_LAST_IMAGE.pop(chat_id, None)
+
+            # در صورت تمایل جلسه را پاک کن تا برای عکس بعدی از ابتدا شروع شود:
+            # SESSION.pop(chat_id, None)
+
+            return {"ok": True}
+
         return {"ok": True}
 
-    # ---- 2) معمولی: message/edited_message ----
+    # ---- پیام معمولی (عکس/متن) ----
     msg  = payload.get("message") or payload.get("edited_message") or {}
     chat = (msg.get("chat") or {})
     chat_id = chat.get("id")
@@ -252,16 +312,14 @@ async def webhook(req: Request):
     text   = (msg.get("text") or "").strip()
     photos = msg.get("photo") or []
 
-    # /start
     if text and text.startswith("/start"):
         await send_text(
             chat_id,
-            "سلام! عکس پیتزا را بفرست. بعد من لیست برندها را می‌دهم تا انتخاب کنی؛ "
-            "سپس تحلیل دوخطی + مرجع همان برند (چند حالت) را می‌فرستم."
+            "سلام! عکس پیتزا را بفرست. سپس با دکمه‌ها: برند → آیتم → شعبه را انتخاب می‌کنی و من تحلیل دوخطی + مرجع دما/زمان برند را می‌فرستم.\n"
+            "برای تغییر مرجع برندها: /setdata"
         )
         return {"ok": True}
 
-    # /setdata  (اختیاری: تعویض دیتا از چت)
     if text and text.lower().startswith("/setdata"):
         new_text = text.split("\n", 1)[1].strip() if "\n" in text else ""
         if not new_text:
@@ -274,25 +332,26 @@ async def webhook(req: Request):
         await send_text(chat_id, f"✅ داده ثبت شد. برندها: {', '.join(all_brands()) or '—'}")
         return {"ok": True}
 
-    # /brands (اختیاری: نمایش لیست برندها)
     if text and text.lower().startswith("/brands"):
         ensure_data()
         await send_text(chat_id, "برندهای موجود: " + (", ".join(all_brands()) or "—"))
         return {"ok": True}
 
-    # کاربر عکس می‌فرستد → عکس را ذخیره کن و کیبورد برند بده
     if photos:
         try:
             file_id = photos[-1]["file_id"]
             img_bytes = await download_telegram_file(file_id)
-            SESSION_LAST_IMAGE[chat_id] = img_bytes
-            await send_brand_keyboard(chat_id, "برند را انتخاب کن:")
+            ses = get_session(chat_id)
+            ses["image"] = img_bytes
+            ses["brand"] = ""
+            ses["item"] = ""
+            ses["branch"] = ""
+            await send_brand_keyboard(chat_id)
         except Exception as e:
             print("ERROR processing:", repr(e))
             await send_text(chat_id, "⚠️ خطا در دریافت تصویر. دوباره تلاش کن.")
         return {"ok": True}
 
-    # فقط متن عادی
     if text:
-        await send_text(chat_id, "برای شروع، یک عکس بفرست تا کیبورد انتخاب برند نمایش داده شود.")
+        await send_text(chat_id, "برای شروع، یک عکس بفرست تا مراحل دکمه‌ای اجرا شود.")
     return {"ok": True}
